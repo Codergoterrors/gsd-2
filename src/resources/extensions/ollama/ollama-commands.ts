@@ -12,7 +12,6 @@
  */
 
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
-import { Text } from "@gsd/pi-tui";
 import * as client from "./ollama-client.js";
 import { discoverModels, formatModelForDisplay } from "./ollama-discovery.js";
 import { formatModelSize } from "./model-capabilities.js";
@@ -49,6 +48,17 @@ export function registerOllamaCommands(pi: ExtensionAPI): void {
 	});
 }
 
+
+function createDismissableOverlay(lines: string[], theme: any, done: (r: undefined) => void, hint = true) {
+	function handleInput(_data: string) {
+		done(undefined);
+	}
+	function render(_width: number): string[] {
+		const themed = lines.map((l) => theme.fg('text', l));
+		return hint ? [...themed, '', theme.fg('dim', ' Press any key to dismiss')] : themed;
+	}
+	return { render, handleInput, invalidate: () => {} };
+}
 async function handleStatus(ctx: any): Promise<void> {
 	const running = await client.isRunning();
 	if (!running) {
@@ -99,13 +109,7 @@ async function handleStatus(ctx: any): Promise<void> {
 		lines.push(`Error listing models: ${err instanceof Error ? err.message : String(err)}`);
 	}
 
-	await ctx.ui.custom(
-		(tui: any, theme: any, _kb: any, done: (r: undefined) => void) => {
-			const text = new Text(lines.map((l) => theme.fg("fg", l)).join("\n"), 0, 0);
-			setTimeout(() => done(undefined), 0);
-			return text;
-		},
-	);
+	await ctx.ui.custom((_tui, theme, _kb, done) => createDismissableOverlay(lines, theme, done));
 }
 
 async function handleList(ctx: any): Promise<void> {
@@ -126,13 +130,7 @@ async function handleList(ctx: any): Promise<void> {
 		lines.push(`  ${formatModelForDisplay(m)}`);
 	}
 
-	await ctx.ui.custom(
-		(tui: any, theme: any, _kb: any, done: (r: undefined) => void) => {
-			const text = new Text(lines.map((l) => theme.fg("fg", l)).join("\n"), 0, 0);
-			setTimeout(() => done(undefined), 0);
-			return text;
-		},
-	);
+	await ctx.ui.custom((_tui, theme, _kb, done) => createDismissableOverlay(lines, theme, done));
 }
 
 async function handlePull(modelName: string, ctx: any): Promise<void> {
@@ -232,13 +230,7 @@ async function handlePs(ctx: any): Promise<void> {
 			lines.push(`  ${m.name}  ${totalSize}  ${vram}  expires in ${idleMin}m`);
 		}
 
-		await ctx.ui.custom(
-			(tui: any, theme: any, _kb: any, done: (r: undefined) => void) => {
-				const text = new Text(lines.map((l) => theme.fg("fg", l)).join("\n"), 0, 0);
-				setTimeout(() => done(undefined), 0);
-				return text;
-			},
-		);
+		await ctx.ui.custom((_tui, theme, _kb, done) => createDismissableOverlay(lines, theme, done));
 	} catch (err) {
 		ctx.ui.notify(
 			`Failed to get running models: ${err instanceof Error ? err.message : String(err)}`,
