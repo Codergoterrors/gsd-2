@@ -104,12 +104,12 @@ async function handleStatus(ctx: any): Promise<void> {
 				done(undefined);
 			}
 			function render(_width: number): string[] {
-				return [
-					...lines.map((l) => theme.fg("text", l)),
-					"",
-					theme.fg("dim", " Press any key to dismiss"),
-				];
-			}
+					return [
+						...lines.map((l) => theme.fg("text", l)),
+						"",
+						theme.fg("dim", " Press any key to dismiss"),
+					];
+				}
 			return { render, handleInput, invalidate: () => {} };
 		},
 	);
@@ -139,8 +139,8 @@ async function handleList(ctx: any): Promise<void> {
 				done(undefined);
 			}
 			function render(_width: number): string[] {
-				return lines.map((l) => theme.fg("text", l));
-			}
+					return lines.map((l) => theme.fg("text", l));
+				}
 			return { render, handleInput, invalidate: () => {} };
 		},
 	);
