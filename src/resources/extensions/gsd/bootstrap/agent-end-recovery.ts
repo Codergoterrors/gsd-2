@@ -1,7 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 
 import { logWarning } from "../workflow-logger.js";
-import { checkAutoStartAfterDiscuss } from "../guided-flow.js";
+import {
+  checkAutoStartAfterDiscuss,
+  maybeHandleReadyPhraseWithoutFiles,
+  maybeHandleEmptyIntentTurn,
+  resetEmptyTurnCounter,
+} from "../guided-flow.js";
+import { clearPathCache } from "../paths.js";
 import { getAutoDashboardData, getAutoModeStartModel, isAutoActive, pauseAuto, setCurrentDispatchedModelId } from "../auto.js";
 import { getNextFallbackModel, resolveModelWithFallbacksForUnit } from "../preferences.js";
 import { pauseAutoForProviderError } from "../provider-error-pause.js";
@@ -71,10 +77,34 @@ export async function handleAgentEnd(
   event: { messages: any[] },
   ctx: ExtensionContext,
 ): Promise<void> {
+  // #4648 — Invalidate the directory-listing cache before any artifact-existence
+  // checks. The LLM may have written milestone files (CONTEXT.md, ROADMAP.md,
+  // PROJECT.md, REQUIREMENTS.md) via tool calls during the turn that just
+  // ended. `paths.ts` caches readdir() results without a TTL, so without this
+  // flush, `resolveMilestoneFile` returns the pre-write listing and the guards
+  // below (`checkAutoStartAfterDiscuss` and `maybeHandleReadyPhraseWithoutFiles`)
+  // falsely report files as missing — producing a spurious "ready signal
+  // rejected" loop even though the files are on disk.
+  clearPathCache();
+
   if (checkAutoStartAfterDiscuss()) {
     clearDiscussionFlowState();
     return;
   }
+
+  // #4573 — When the LLM emits "Milestone X ready." but the required files
+  // are missing, `checkAutoStartAfterDiscuss` returns false silently. Surface
+  // that and nudge the LLM to complete the writes before the user hits the
+  // downstream "All milestones complete" warning loop.
+  if (maybeHandleReadyPhraseWithoutFiles(event)) return;
+
+  // #4573 — Empty-turn recovery: if the LLM announced intent in prose but
+  // emitted no tool calls, nudge it to execute. Fires only when auto-mode is
+  // active or a discussion autostart is pending (non-auto interactive discuss
+  // is user-driven). Runs before `isAutoActive` early return so pending
+  // discussions (where isAutoActive may be false) still get recovered.
+  if (maybeHandleEmptyIntentTurn(event, isAutoActive())) return;
+
   if (!isAutoActive()) return;
   if (isSessionSwitchInFlight()) return;
 
@@ -336,6 +366,9 @@ export async function handleAgentEnd(
   // ── Success path ─────────────────────────────────────────────────────────
   try {
     resetRetryState(retryState);
+    // #4573 — Reset the empty-turn counter on any successful agent turn so
+    // transient stalls don't accumulate across independent units.
+    resetEmptyTurnCounter();
     resolveAgentEnd(event);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

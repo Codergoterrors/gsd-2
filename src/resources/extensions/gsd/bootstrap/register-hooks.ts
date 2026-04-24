@@ -18,12 +18,13 @@ import { loadToolApiKeys } from "../commands-config.js";
 import { loadFile, saveFile, formatContinue } from "../files.js";
 import { deriveState } from "../state.js";
 import { getAutoDashboardData, isAutoActive, isAutoPaused, markToolEnd, markToolStart, recordToolInvocationError } from "../auto.js";
-import { hideFooter } from "../auto-dashboard.js";
+
 import { isParallelActive, shutdownParallel } from "../parallel-orchestrator.js";
 import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
 import { resetAskUserQuestionsCache } from "../../ask-user-questions.js";
-import { recordToolCall as safetyRecordToolCall, recordToolResult as safetyRecordToolResult } from "../safety/evidence-collector.js";
+import { recordToolCall as safetyRecordToolCall, recordToolResult as safetyRecordToolResult, saveEvidenceToDisk } from "../safety/evidence-collector.js";
+import { parseUnitId } from "../unit-id.js";
 import { classifyCommand } from "../safety/destructive-guard.js";
 import { logWarning as safetyLogWarning } from "../workflow-logger.js";
 import { installNotifyInterceptor } from "./notify-interceptor.js";
@@ -48,7 +49,9 @@ export function registerHooks(
     initNotificationStore(process.cwd());
     installNotifyInterceptor(ctx);
     initNotificationWidget(ctx);
-    initHealthWidget(ctx);
+    if (!isAutoActive()) {
+      initHealthWidget(ctx);
+    }
     resetWriteGateState();
     resetToolCallLoopGuard();
     resetAskUserQuestionsCache();
@@ -90,7 +93,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 
@@ -113,7 +116,7 @@ export function registerHooks(
     }
     loadToolApiKeys();
     if (isAutoActive()) {
-      ctx.ui.setFooter(hideFooter);
+      ctx.ui.setWidget("gsd-health", undefined);
     }
   });
 
@@ -481,7 +484,7 @@ export function registerHooks(
 
   pi.on("tool_execution_start", async (event) => {
     if (!isAutoActive()) return;
-    markToolStart(event.toolCallId);
+    markToolStart(event.toolCallId, event.toolName);
   });
 
   pi.on("tool_execution_end", async (event) => {
@@ -497,6 +500,15 @@ export function registerHooks(
     // Safety harness: record tool execution results for evidence cross-referencing
     if (isAutoActive()) {
       safetyRecordToolResult(event.toolCallId, event.toolName, event.result, event.isError);
+      // Persist evidence to disk after each tool result so it survives a session
+      // restart mid-unit (Bug #4385 — non-persisted evidence false positives).
+      const dash = getAutoDashboardData();
+      if (dash.basePath && dash.currentUnit?.type === "execute-task") {
+        const { milestone: pMid, slice: pSid, task: pTid } = parseUnitId(dash.currentUnit.id);
+        if (pMid && pSid && pTid) {
+          saveEvidenceToDisk(dash.basePath, pMid, pSid, pTid);
+        }
+      }
     }
   });
 

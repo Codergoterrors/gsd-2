@@ -45,6 +45,7 @@ import {
   nativeBranchListMerged,
   nativeBranchDelete,
   nativeWorktreeRemove,
+  nativeCommitCountBetween,
 } from "./native-git-bridge.js";
 import { GitServiceImpl } from "./git-service.js";
 import {
@@ -55,13 +56,16 @@ import {
 import { getAutoWorktreePath, isInAutoWorktree } from "./auto-worktree.js";
 import { readResourceVersion, cleanStaleRuntimeUnits } from "./auto-worktree.js";
 import { worktreePath as getWorktreeDir, isInsideWorktreesDir } from "./worktree-manager.js";
+import { emitWorktreeOrphaned } from "./worktree-telemetry.js";
 import { initMetrics } from "./metrics.js";
 import { initRoutingHistory } from "./routing-history.js";
 import { restoreHookState, resetHookState } from "./post-unit-hooks.js";
 import { resetProactiveHealing, setLevelChangeCallback } from "./doctor-proactive.js";
 import { snapshotSkills } from "./skill-discovery.js";
 import { isDbAvailable, getMilestone, openDatabase, getDbStatus } from "./gsd-db.js";
-import { hideFooter } from "./auto-dashboard.js";
+import { isClosedStatus } from "./status-guards.js";
+import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
+
 import {
   debugLog,
   enableDebug,
@@ -74,6 +78,7 @@ import type { AutoSession } from "./auto/session.js";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   rmSync,
   statSync,
@@ -184,10 +189,60 @@ export function auditOrphanedMilestoneBranches(
     const milestoneId = branch.replace(/^milestone\//, "");
     const milestone = getMilestone(milestoneId);
 
-    // Only audit completed milestones
-    if (!milestone || milestone.status !== "complete") continue;
+    if (!milestone) continue;
 
     const isMerged = mergedBranches.has(branch);
+
+    // #4762 — in-progress milestone branch with unmerged commits ahead of
+    // main. This is the pre-completion orphan case: auto-mode exited without
+    // completing the milestone (pause, stop, crash, merge error, blocker) and
+    // work is stranded on the branch or in the worktree. Data safety first:
+    // we never delete or touch; we just surface a warning so the user knows
+    // where to look.
+    //
+    // Gate on isClosedStatus so we only warn about genuinely open milestones.
+    // Parked/other closed statuses go through the legacy complete/unmerged
+    // path below where appropriate.
+    if (!isClosedStatus(milestone.status)) {
+      if (isMerged) continue; // nothing to recover
+      let commitsAhead = 0;
+      try {
+        commitsAhead = nativeCommitCountBetween(basePath, mainBranch, branch);
+      } catch {
+        // Rev-walk failure — skip rather than noise
+        continue;
+      }
+      if (commitsAhead === 0) continue;
+
+      const wtDir = getWorktreeDir(basePath, milestoneId);
+      const wtDirExists = existsSync(wtDir);
+      const wtSuffix = wtDirExists
+        ? ` Worktree directory at .gsd/worktrees/${milestoneId}/ holds the live work.`
+        : "";
+      warnings.push(
+        `Branch ${branch} has ${commitsAhead} commit(s) ahead of ${mainBranch} for in-progress milestone ${milestoneId}.` +
+        wtSuffix +
+        ` Run \`/gsd auto\` to resume, or merge manually if abandoning.`,
+      );
+
+      // #4764 telemetry
+      try {
+        emitWorktreeOrphaned(basePath, milestoneId, {
+          reason: "in-progress-unmerged",
+          commitsAhead,
+          worktreeDirExists: wtDirExists,
+        });
+      } catch (err) {
+        logWarning("engine", `worktree-orphaned telemetry failed for ${milestoneId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      continue;
+    }
+
+    // Only the "complete" status participates in the merged/unmerged cleanup
+    // paths below — other closed statuses (parked, etc.) are intentionally
+    // left alone.
+    if (milestone.status !== "complete") continue;
 
     if (isMerged) {
       // Branch is merged — safe to delete branch and clean up worktree dir
@@ -233,6 +288,16 @@ export function auditOrphanedMilestoneBranches(
         `Branch ${branch} exists for completed milestone ${milestoneId} but is NOT merged into ${mainBranch}. ` +
         `This may contain unmerged work. Merge manually or run \`/gsd health --fix\` to resolve.`,
       );
+
+      // #4764 telemetry
+      try {
+        emitWorktreeOrphaned(basePath, milestoneId, {
+          reason: "complete-unmerged",
+          worktreeDirExists: existsSync(getWorktreeDir(basePath, milestoneId)),
+        });
+      } catch (err) {
+        logWarning("engine", `worktree-orphaned telemetry failed for ${milestoneId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -419,15 +484,34 @@ export async function bootstrapAutoSession(
     // Invalidate caches before initial state derivation
     invalidateAllCaches();
 
-    // Clean stale runtime unit files for completed milestones (#887)
-    cleanStaleRuntimeUnits(
-      gsdRoot(base),
-      (mid) => !!resolveMilestoneFile(base, mid, "SUMMARY"),
-    );
-
     // Open the project-root DB before deriveState so DB-backed state
     // derivation (queue-order, task status) works on a cold start (#2841).
+    // Must happen before cleanStaleRuntimeUnits so the cleanup predicate can
+    // consult DB status and avoid clearing runtime units for milestones that
+    // only have a failure-path SUMMARY on disk (#4663).
     await openProjectDbIfPresent(base);
+
+    // Clean stale runtime unit files for completed milestones (#887).
+    // DB-authoritative: when DB is available, require DB status to be closed
+    // before clearing runtime units. A SUMMARY file alone is no longer
+    // trusted as proof of completion (#4663). Fall back to SUMMARY-file
+    // presence only when DB is unavailable (legacy/pre-migration).
+    cleanStaleRuntimeUnits(
+      gsdRoot(base),
+      (mid) => {
+        if (isDbAvailable()) {
+          const row = getMilestone(mid);
+          return !!row && isClosedStatus(row.status);
+        }
+        const summaryFile = resolveMilestoneFile(base, mid, "SUMMARY");
+        if (!summaryFile) return false;
+        try {
+          return classifyMilestoneSummaryContent(readFileSync(summaryFile, "utf-8")) !== "failure";
+        } catch {
+          return false;
+        }
+      },
+    );
 
     // ── Orphaned milestone branch audit ──
     // Catches completed milestones whose teardown (merge + branch delete)
@@ -553,37 +637,15 @@ export async function bootstrapAutoSession(
         const { showSmartEntry } = await import("./guided-flow.js");
         await showSmartEntry(ctx, pi, base, { step: requestedStepMode });
 
-        invalidateAllCaches();
-        const postState = await deriveState(base);
-        if (
-          postState.activeMilestone &&
-          postState.phase !== "complete" &&
-          postState.phase !== "pre-planning"
-        ) {
-          s.consecutiveCompleteBootstraps = 0; // Successfully advanced past "complete"
-          state = postState;
-        } else if (
-          postState.activeMilestone &&
-          postState.phase === "pre-planning"
-        ) {
-          const contextFile = resolveMilestoneFile(
-            base,
-            postState.activeMilestone.id,
-            "CONTEXT",
-          );
-          const hasContext = !!(contextFile && (await loadFile(contextFile)));
-          if (hasContext) {
-            state = postState;
-          } else {
-            ctx.ui.notify(
-              "Discussion completed but no milestone context was written. Run /gsd to try the discussion again, or /gsd auto after creating the milestone manually.",
-              "warning",
-            );
-            return releaseLockAndReturn();
-          }
-        } else {
-          return releaseLockAndReturn();
-        }
+        // showSmartEntry dispatches via pi.sendMessage() which is fire-and-forget:
+        // it queues the message and returns immediately, before the LLM turn runs.
+        // Checking postState here would always see the pre-dispatch state, causing
+        // the premature "Discussion completed but..." warning (#3420).
+        //
+        // checkAutoStartAfterDiscuss (in guided-flow.ts) already handles re-entering
+        // auto-mode by calling startAutoDetached after the discussion completes.
+        // Release the lock and let the async dispatch proceed.
+        return releaseLockAndReturn();
       }
 
       // Active milestone exists but has no roadmap
@@ -595,17 +657,16 @@ export async function bootstrapAutoSession(
           const { showSmartEntry } = await import("./guided-flow.js");
           await showSmartEntry(ctx, pi, base, { step: requestedStepMode });
 
-          invalidateAllCaches();
-          const postState = await deriveState(base);
-          if (postState.activeMilestone && postState.phase !== "pre-planning") {
-            state = postState;
-          } else {
-            ctx.ui.notify(
-              "Discussion completed but milestone context is still missing. Run /gsd to try again.",
-              "warning",
-            );
-            return releaseLockAndReturn();
-          }
+          // showSmartEntry dispatches via pi.sendMessage() which is fire-and-forget:
+          // it queues the message and returns immediately, before the LLM turn runs.
+          // Checking postState here fires before the LLM has had a turn, so the
+          // pre-planning phase would still appear unchanged and a premature warning
+          // would be emitted (#3420).
+          //
+          // checkAutoStartAfterDiscuss (in guided-flow.ts) already handles re-entering
+          // auto-mode by calling startAutoDetached after the discussion completes.
+          // Release the lock and let the async dispatch proceed.
+          return releaseLockAndReturn();
         }
       }
 
@@ -824,9 +885,6 @@ export async function bootstrapAutoSession(
     }
 
     ctx.ui.setStatus("gsd-auto", s.stepMode ? "next" : "auto");
-    ctx.ui.setFooter(hideFooter);
-    // Hide gsd-health during AUTO — gsd-progress is the single source of truth
-    // for last-commit / cost / health signal while auto is running.
     ctx.ui.setWidget("gsd-health", undefined);
     const modeLabel = s.stepMode ? "Step-mode" : "Auto-mode";
     const pendingCount = (state.registry ?? []).filter(

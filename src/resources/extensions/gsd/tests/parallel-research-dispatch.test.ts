@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { resolveDispatch } from "../auto-dispatch.ts";
+import { extractSourceRegion } from "./test-helpers.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -79,7 +80,9 @@ test("dispatch: parallel-research-slices requires 2+ slices", () => {
 
 test("dispatch: parallel-research-slices respects skip_research", () => {
   const ruleIdx = dispatchSrc.indexOf("parallel-research-slices");
-  const ruleBlock = dispatchSrc.slice(ruleIdx, ruleIdx + 500);
+  // Pin to the located occurrence — if "parallel-research-slices" appears
+  // more than once in the source, fromIdx keeps the anchor deterministic.
+  const ruleBlock = extractSourceRegion(dispatchSrc, "parallel-research-slices", { fromIdx: ruleIdx });
   assert.ok(
     ruleBlock.includes("skip_research") || dispatchSrc.slice(ruleIdx - 300, ruleIdx).includes("skip_research"),
     "rule should check skip_research preference",
@@ -108,6 +111,25 @@ test("template: parallel-research-slices.md has required variables", () => {
   assert.ok(templateSrc.includes("{{sliceCount}}"), "template should use sliceCount");
   assert.ok(templateSrc.includes("{{mid}}"), "template should use mid");
   assert.ok(templateSrc.includes("{{subagentPrompts}}"), "template should use subagentPrompts");
+});
+
+test("#4068: template: parallel-research-slices retry cap prevents infinite subagent loop", () => {
+  // The template must cap retries at 1 ("retry it once") and instruct the
+  // agent to write a BLOCKER note on the second failure rather than looping.
+  // Without this, a timing-out subagent causes the orchestrating agent to
+  // retry indefinitely (issue #4068 / #4355).
+  assert.ok(
+    templateSrc.includes("once") || templateSrc.includes("one retry") || templateSrc.match(/retry.{0,20}once/),
+    "template should cap subagent retries at one",
+  );
+  assert.ok(
+    templateSrc.toLowerCase().includes("blocker"),
+    "template should instruct writing a BLOCKER note instead of infinite retries",
+  );
+  assert.ok(
+    !templateSrc.match(/re-run it individually\s*\n/),
+    "template must not have unbounded re-run instruction without a retry cap",
+  );
 });
 
 // ─── Validate milestone prompt ────────────────────────────────────────────

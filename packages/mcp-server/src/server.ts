@@ -13,8 +13,10 @@
 
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import type { SessionManager } from './session-manager.js';
+import { isRemoteConfigured, tryRemoteQuestions } from './remote-questions.js';
 import { readProgress } from './readers/state.js';
 import { readRoadmap } from './readers/roadmap.js';
 import { readHistory } from './readers/metrics.js';
@@ -24,7 +26,7 @@ import { buildGraph, writeGraph, writeSnapshot, graphStatus, graphQuery, graphDi
 import { resolveGsdRoot } from './readers/paths.js';
 import { runDoctorLite } from './readers/doctor-lite.js';
 import { registerWorkflowTools, validateProjectDir } from './workflow-tools.js';
-import { applySecrets, checkExistingEnvKeys, detectDestination } from './env-writer.js';
+import { applySecrets, checkExistingEnvKeys, detectDestination, resolveProjectEnvFilePath } from './env-writer.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,6 +35,59 @@ import { applySecrets, checkExistingEnvKeys, detectDestination } from './env-wri
 const MCP_PKG = '@modelcontextprotocol/sdk';
 const SERVER_NAME = 'gsd';
 const SERVER_VERSION = '2.53.0';
+
+/** User-interaction timeout — generous but bounded so elicitation can't hang indefinitely (#4586). */
+const ELICIT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Default child-process runner used by secure_env_collect to push secrets
+ * into `vercel env add` / `npx convex env set`. Previously `applySecrets`
+ * was called without an `execFn`, so vercel/convex destinations silently
+ * dropped every collected key. This restores the write path.
+ */
+function defaultExecFn(
+  cmd: string,
+  args: string[],
+): Promise<{ code: number; stderr: string }> {
+  return new Promise((res) => {
+    // stdin: ignore — avoids hanging if the child ever prompts interactively.
+    // stdout: ignore — consumer only cares about stderr + exit code, and an
+    //   un-drained pipe deadlocks once the kernel buffer (~64KB) fills.
+    // stderr: pipe — captured below for error surfacing.
+    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (err) => res({ code: 1, stderr: err.message }));
+    child.on('close', (code) => res({ code: code ?? 1, stderr }));
+  });
+}
+
+/**
+ * Race a promise against a timeout. Rejects with a typed error on timeout so
+ * callers can return a specific MCP error response rather than hanging.
+ *
+ * @param timeoutMs - override for testing; defaults to ELICIT_TIMEOUT_MS
+ */
+export async function withElicitTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs = ELICIT_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs / 60000} minutes — no user response received`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tool result helpers
@@ -458,17 +513,40 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
 
   // -----------------------------------------------------------------------
   // gsd_cancel — cancel a running session
+  //
+  // Supports two lookup strategies:
+  //   1. sessionId  — the ID returned from gsd_execute (primary)
+  //   2. projectDir — absolute path to the project directory (fallback)
+  //
+  // The projectDir fallback handles interactive sessions (started via
+  // `/gsd auto` in the terminal) and post-restart MCP sessions that were
+  // never registered with a sessionId in this server instance.
   // -----------------------------------------------------------------------
   server.tool(
     'gsd_cancel',
-    'Cancel a running GSD session. Aborts the current operation and stops the process.',
+    'Cancel a running GSD session. Aborts the current operation and stops the process. Provide sessionId (from gsd_execute) or projectDir as a fallback for interactive/restarted sessions.',
     {
-      sessionId: z.string().describe('Session ID returned from gsd_execute'),
+      sessionId: z.string().optional().describe('Session ID returned from gsd_execute'),
+      projectDir: z.string().optional().describe('Absolute path to the project directory (fallback when sessionId is unavailable)'),
     },
     async (args: Record<string, unknown>) => {
-      const { sessionId } = args as { sessionId: string };
+      const { sessionId, projectDir } = args as { sessionId?: string; projectDir?: string };
       try {
-        await sessionManager.cancelSession(sessionId);
+        if (!sessionId && !projectDir) {
+          return errorContent('Either sessionId or projectDir must be provided');
+        }
+        if (sessionId) {
+          try {
+            await sessionManager.cancelSession(sessionId);
+          } catch (err) {
+            if (!projectDir || !(err instanceof Error) || !err.message.includes('Session not found')) {
+              throw err;
+            }
+            await sessionManager.cancelSessionByDir(projectDir);
+          }
+        } else if (projectDir) {
+          await sessionManager.cancelSessionByDir(projectDir);
+        }
         return jsonContent({ cancelled: true });
       } catch (err) {
         return errorContent(err instanceof Error ? err.message : String(err));
@@ -545,13 +623,33 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
         allowMultiple: z.boolean().optional().describe('If true, the user can select multiple options. No "None of the above" option is added.'),
       })).describe('Questions to show the user. Prefer 1 and do not exceed 3.'),
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, extra?: McpToolExtra) => {
       const { questions } = args as unknown as AskUserQuestionsParams;
       try {
         const validationError = validateAskUserQuestionsPayload(questions);
         if (validationError) return errorContent(validationError);
 
-        const elicitation = await server.server.elicitInput(buildAskUserQuestionsElicitRequest(questions));
+        // Delegate to remote-questions manager when a remote channel is configured
+        // (Discord, Slack, Telegram). This path is the only one reachable for
+        // Claude Code-under-gsd sessions, which have no local TUI.
+        if (isRemoteConfigured()) {
+          const remoteResult = await tryRemoteQuestions(questions, extra?.signal);
+          if (remoteResult) {
+            const details = remoteResult.details as Record<string, unknown> | undefined;
+            if (details?.['timed_out'] || details?.['error']) {
+              // Surface timeout/error as plain text so the LLM knows to retry
+              return textContent(remoteResult.content[0]?.text ?? 'Remote questions timed out or failed');
+            }
+            return textContent(remoteResult.content[0]?.text ?? '');
+          }
+          // resolveRemoteConfig() returned null between isRemoteConfigured() and
+          // tryRemoteQuestions() (e.g. env var was cleared) — fall through to local.
+        }
+
+        const elicitation = await withElicitTimeout(
+          server.server.elicitInput(buildAskUserQuestionsElicitRequest(questions)),
+          'ask_user_questions',
+        );
         if (elicitation.action !== 'accept' || !elicitation.content) {
           return textContent('ask_user_questions was cancelled before receiving a response');
         }
@@ -591,7 +689,7 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
 
       try {
         const resolvedProjectDir = validateProjectDir(projectDir);
-        const resolvedEnvPath = resolve(resolvedProjectDir, envFilePath ?? '.env');
+        const resolvedEnvPath = resolveProjectEnvFilePath(resolvedProjectDir, envFilePath ?? '.env');
 
         // (1) Check which keys already exist
         const allKeyNames = keys.map((k) => k.key);
@@ -627,14 +725,17 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
         }
 
         // (3) Elicit input from the MCP client
-        const elicitation = await server.server.elicitInput({
-          message: `Enter values for ${pendingKeys.length} environment variable(s). Values are written directly to the project and never shown to the AI.`,
-          requestedSchema: {
-            type: 'object',
-            properties,
-            required,
-          },
-        });
+        const elicitation = await withElicitTimeout(
+          server.server.elicitInput({
+            message: `Enter values for ${pendingKeys.length} environment variable(s). Values are written directly to the project and never shown to the AI.`,
+            requestedSchema: {
+              type: 'object',
+              properties,
+              required,
+            },
+          }),
+          'secure_env_collect',
+        );
 
         if (elicitation.action !== 'accept' || !elicitation.content) {
           return textContent('secure_env_collect was cancelled by user.');
@@ -661,6 +762,7 @@ export async function createMcpServer(sessionManager: SessionManager): Promise<{
         const { applied, errors } = await applySecrets(provided, resolvedDestination, {
           envFilePath: resolvedEnvPath,
           environment,
+          execFn: defaultExecFn,
         });
 
         // (7) Build result — NEVER include secret values

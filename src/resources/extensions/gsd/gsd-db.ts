@@ -180,7 +180,7 @@ function openRawDb(path: string): unknown {
   return new Database(path);
 }
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 
 function indexExists(db: DbAdapter, name: string): boolean {
   return !!db.prepare(
@@ -559,18 +559,6 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
 
     db.exec("CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(superseded_by)");
 
-    // Existing DBs may arrive here before migrateSchema() has added columns
-    // that fresh installs already have. Add only columns needed by bootstrap
-    // indexes so old DBs can open far enough for the normal migration chain.
-    ensureBootstrapIndexColumns(db);
-
-    if (columnExists(db, "memories", "scope")) {
-      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)");
-    }
-    db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_kind ON memory_sources(kind)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_scope ON memory_sources(scope)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_from ON memory_relations(from_id)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(to_id)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_replan_history_milestone ON replan_history(milestone_id, created_at)");
 
     // v13 indexes — hot-path dispatch queries
@@ -588,9 +576,6 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
     db.exec("CREATE INDEX IF NOT EXISTS idx_turn_git_tx_turn ON turn_git_transactions(trace_id, turn_id)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_audit_events_trace ON audit_events(trace_id, ts)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_audit_events_turn ON audit_events(trace_id, turn_id, ts)");
-    // ADR-011 Phase 2 — also created by the v17 migration; fresh installs
-    // skip migrations so the index must be created here too.
-    db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_escalation_pending ON tasks(milestone_id, slice_id, escalation_pending)");
 
     db.exec(`CREATE VIEW IF NOT EXISTS active_decisions AS SELECT * FROM decisions WHERE superseded_by IS NULL`);
     db.exec(`CREATE VIEW IF NOT EXISTS active_requirements AS SELECT * FROM requirements WHERE superseded_by IS NULL`);
@@ -598,6 +583,17 @@ function initSchema(db: DbAdapter, fileBacked: boolean): void {
 
     const existing = db.prepare("SELECT count(*) as cnt FROM schema_version").get();
     if (existing && (existing["cnt"] as number) === 0) {
+      // Fresh install — all tables are created above with the full current schema,
+      // so it is safe to create all migration-specific indexes here.  For existing
+      // databases these indexes are created inside the individual migration guards
+      // in migrateSchema() after the corresponding columns have been added.
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_escalation_pending ON tasks(milestone_id, slice_id, escalation_pending)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_kind ON memory_sources(kind)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_scope ON memory_sources(scope)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_from ON memory_relations(from_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_relations_to ON memory_relations(to_id)");
+
       db.prepare(
         "INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)",
       ).run({
@@ -672,14 +668,6 @@ export function isMemoriesFtsAvailable(db: DbAdapter): boolean {
 
 function ensureColumn(db: DbAdapter, table: string, column: string, ddl: string): void {
   if (!columnExists(db, table, column)) db.exec(ddl);
-}
-
-function ensureBootstrapIndexColumns(db: DbAdapter): void {
-  ensureColumn(db, "memories", "scope", `ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'`);
-  ensureColumn(db, "memories", "tags", `ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
-  ensureColumn(db, "memory_sources", "scope", `ALTER TABLE memory_sources ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'`);
-  ensureColumn(db, "memory_sources", "tags", `ALTER TABLE memory_sources ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
-  ensureColumn(db, "tasks", "escalation_pending", `ALTER TABLE tasks ADD COLUMN escalation_pending INTEGER NOT NULL DEFAULT 0`);
 }
 
 function migrateSchema(db: DbAdapter): void {
@@ -949,19 +937,24 @@ function migrateSchema(db: DbAdapter): void {
     }
 
     if (currentVersion < 12) {
+      // NOTE: The original DDL used COALESCE(task_id, '') in the PRIMARY KEY
+      // expression, which is invalid SQLite syntax and causes startup errors on
+      // DBs that migrate through v12. The corrected DDL uses
+      // task_id TEXT NOT NULL DEFAULT '' with a plain column list PK. DBs that
+      // were created with the broken DDL are repaired by the v22 migration below.
       db.exec(`
         CREATE TABLE IF NOT EXISTS quality_gates (
           milestone_id TEXT NOT NULL,
           slice_id TEXT NOT NULL,
           gate_id TEXT NOT NULL,
           scope TEXT NOT NULL DEFAULT 'slice',
-          task_id TEXT DEFAULT NULL,
+          task_id TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'pending',
           verdict TEXT NOT NULL DEFAULT '',
           rationale TEXT NOT NULL DEFAULT '',
           findings TEXT NOT NULL DEFAULT '',
           evaluated_at TEXT DEFAULT NULL,
-          PRIMARY KEY (milestone_id, slice_id, gate_id, COALESCE(task_id, '')),
+          PRIMARY KEY (milestone_id, slice_id, gate_id, task_id),
           FOREIGN KEY (milestone_id, slice_id) REFERENCES slices(milestone_id, id)
         )
       `);
@@ -1119,6 +1112,10 @@ function migrateSchema(db: DbAdapter): void {
           tags TEXT NOT NULL DEFAULT '[]'
         )
       `);
+      // If memory_sources already existed before v18 (created by an earlier
+      // version of initSchema that lacked scope/tags), add the missing columns.
+      ensureColumn(db, "memory_sources", "scope", `ALTER TABLE memory_sources ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'`);
+      ensureColumn(db, "memory_sources", "tags", `ALTER TABLE memory_sources ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
       db.exec("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)");
       db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_kind ON memory_sources(kind)");
       db.exec("CREATE INDEX IF NOT EXISTS idx_memory_sources_scope ON memory_sources(scope)");
@@ -1185,6 +1182,52 @@ function migrateSchema(db: DbAdapter): void {
       ensureColumn(db, "memories", "structured_fields", "ALTER TABLE memories ADD COLUMN structured_fields TEXT DEFAULT NULL");
       db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
         ":version": 21,
+        ":applied_at": new Date().toISOString(),
+      });
+    }
+
+    if (currentVersion < 22) {
+      // v22: Repair quality_gates tables that were created by the broken v12
+      // migration (which used COALESCE(task_id, '') as a PK expression — invalid
+      // SQLite DDL). Those DBs have task_id nullable (dflt_value NULL, notnull 0).
+      // Rebuild the table with the correct schema, migrating existing rows via
+      // COALESCE so no data is lost.
+      const qgInfo = db.prepare("PRAGMA table_info(quality_gates)").all() as Array<Record<string, unknown>>;
+      const taskIdCol = qgInfo.find((r) => r["name"] === "task_id");
+      const needsRepair = taskIdCol && (taskIdCol["notnull"] === 0 || taskIdCol["notnull"] === "0");
+      if (needsRepair) {
+        db.exec(`
+          CREATE TABLE quality_gates_new (
+            milestone_id TEXT NOT NULL,
+            slice_id TEXT NOT NULL,
+            gate_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'slice',
+            task_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            verdict TEXT NOT NULL DEFAULT '',
+            rationale TEXT NOT NULL DEFAULT '',
+            findings TEXT NOT NULL DEFAULT '',
+            evaluated_at TEXT DEFAULT NULL,
+            PRIMARY KEY (milestone_id, slice_id, gate_id, task_id),
+            FOREIGN KEY (milestone_id, slice_id) REFERENCES slices(milestone_id, id)
+          )
+        `);
+        db.exec(`
+          INSERT OR IGNORE INTO quality_gates_new
+            (milestone_id, slice_id, gate_id, scope, task_id, status, verdict, rationale, findings, evaluated_at)
+          SELECT milestone_id, slice_id, gate_id, scope, COALESCE(task_id, ''), status, verdict, rationale, findings, evaluated_at
+          FROM quality_gates
+        `);
+        db.exec("DROP TABLE quality_gates");
+        db.exec("ALTER TABLE quality_gates_new RENAME TO quality_gates");
+        db.exec("CREATE INDEX IF NOT EXISTS idx_quality_gates_pending ON quality_gates(milestone_id, slice_id, status)");
+      }
+      // Ensure scope column exists on quality_gates and assessments (guard
+      // against DBs that somehow lack it after a partial migration).
+      ensureColumn(db, "quality_gates", "scope", "ALTER TABLE quality_gates ADD COLUMN scope TEXT NOT NULL DEFAULT 'slice'");
+      ensureColumn(db, "assessments", "scope", "ALTER TABLE assessments ADD COLUMN scope TEXT NOT NULL DEFAULT ''");
+      db.prepare("INSERT INTO schema_version (version, applied_at) VALUES (:version, :applied_at)").run({
+        ":version": 22,
         ":applied_at": new Date().toISOString(),
       });
     }
@@ -2733,7 +2776,10 @@ export function reconcileWorktreeDb(
           FROM wt.artifacts
         `).run());
 
-        // Merge milestones — worktree may have updated status/planning fields
+        // Merge milestones — worktree may have updated status/planning fields.
+        // Never downgrade status: complete > active > pre-planning (#4372).
+        // A stale worktree may carry an older 'active' status for a milestone
+        // that the main DB has already marked 'complete'; preserve the higher status.
         merged.milestones = countChanges(adapter.prepare(`
           INSERT OR REPLACE INTO milestones (
             id, title, status, depends_on, created_at, completed_at,
@@ -2741,11 +2787,25 @@ export function reconcileWorktreeDb(
             verification_contract, verification_integration, verification_operational, verification_uat,
             definition_of_done, requirement_coverage, boundary_map_markdown
           )
-          SELECT id, title, status, depends_on, created_at, completed_at,
-                 vision, success_criteria, key_risks, proof_strategy,
-                 verification_contract, verification_integration, verification_operational, verification_uat,
-                 definition_of_done, requirement_coverage, boundary_map_markdown
-          FROM wt.milestones
+          SELECT w.id, w.title,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.status ELSE w.status
+                 END,
+                 w.depends_on,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.created_at ELSE w.created_at
+                 END,
+                 CASE
+                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   THEN m.completed_at ELSE w.completed_at
+                 END,
+                 w.vision, w.success_criteria, w.key_risks, w.proof_strategy,
+                 w.verification_contract, w.verification_integration, w.verification_operational, w.verification_uat,
+                 w.definition_of_done, w.requirement_coverage, w.boundary_map_markdown
+          FROM wt.milestones w
+          LEFT JOIN milestones m ON m.id = w.id
         `).run());
 
         // Merge slices — preserve worktree progress but never downgrade completed status (#2558).

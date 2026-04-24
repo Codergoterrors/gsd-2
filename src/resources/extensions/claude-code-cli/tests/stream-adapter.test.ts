@@ -8,6 +8,7 @@ import {
 	getResultErrorMessage,
 	makeAbortedMessage,
 	mergePendingToolCalls,
+	buildFinalAssistantContent,
 	resolveClaudePermissionMode,
 	buildPromptFromContext,
 	buildSdkQueryPrompt,
@@ -539,6 +540,71 @@ describe("stream-adapter — Claude Code external tool results", () => {
 			},
 		]);
 	});
+
+	test("buildFinalAssistantContent preserves intermediate tool calls with attached external results", () => {
+		const finalContent = buildFinalAssistantContent({
+			intermediateToolBlocks: [
+				{
+					type: "toolCall",
+					id: "tool-bash-1",
+					name: "bash",
+					arguments: { command: "echo hi" },
+				} as any,
+			],
+			pendingContent: [{ type: "text", text: "All done." }],
+			toolResultsById: new Map([
+				[
+					"tool-bash-1",
+					{
+						content: [{ type: "text", text: "hi\n" }],
+						details: { source: "claude-code" },
+						isError: false,
+					},
+				],
+			]),
+		});
+
+		assert.equal(finalContent[0]?.type, "toolCall");
+		assert.deepEqual((finalContent[0] as any).externalResult, {
+			content: [{ type: "text", text: "hi\n" }],
+			details: { source: "claude-code" },
+			isError: false,
+		});
+		assert.deepEqual(finalContent[1], { type: "text", text: "All done." });
+	});
+
+	test("buildFinalAssistantContent keeps final-turn tool calls when result arrives without a synthetic user boundary", () => {
+		const finalContent = buildFinalAssistantContent({
+			intermediateToolBlocks: [],
+			pendingContent: [
+				{
+					type: "toolCall",
+					id: "tool-read-1",
+					name: "read",
+					arguments: { path: "README.md" },
+				} as any,
+				{ type: "text", text: "Read complete." },
+			],
+			toolResultsById: new Map([
+				[
+					"tool-read-1",
+					{
+						content: [{ type: "text", text: "file contents" }],
+						details: { path: "README.md" },
+						isError: false,
+					},
+				],
+			]),
+		});
+
+		assert.equal(finalContent[0]?.type, "toolCall");
+		assert.deepEqual((finalContent[0] as any).externalResult, {
+			content: [{ type: "text", text: "file contents" }],
+			details: { path: "README.md" },
+			isError: false,
+		});
+		assert.deepEqual(finalContent[1], { type: "text", text: "Read complete." });
+	});
 });
 
 describe("stream-adapter — session persistence (#2859)", () => {
@@ -695,15 +761,18 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, "/tmp/project");
-			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
+			assert.deepEqual(options.disallowedTools, []);
 			assert.deepEqual(options.allowedTools, [
 				"Read",
 				"Write",
 				"Edit",
 				"Glob",
 				"Grep",
-				"Bash(ls:*)",
-				"Bash(pwd)",
+				"Bash",
+				"Agent",
+				"WebFetch",
+				"WebSearch",
+				"AskUserQuestion",
 				"mcp__gsd-workflow__*",
 			]);
 		} finally {
@@ -715,7 +784,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 		}
 	});
 
-	test("buildSdkOptions disables AskUserQuestion for custom workflow MCP server names", () => {
+	test("buildSdkOptions auto-approves every tool for custom workflow MCP server names", () => {
 		const prev = {
 			GSD_WORKFLOW_MCP_COMMAND: process.env.GSD_WORKFLOW_MCP_COMMAND,
 			GSD_WORKFLOW_MCP_NAME: process.env.GSD_WORKFLOW_MCP_NAME,
@@ -733,15 +802,18 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			const options = buildSdkOptions("claude-sonnet-4-20250514", "test");
 			const mcpServers = options.mcpServers as Record<string, any>;
 			assert.ok(mcpServers?.["custom-workflow"], "expected custom workflow server config");
-			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
+			assert.deepEqual(options.disallowedTools, []);
 			assert.deepEqual(options.allowedTools, [
 				"Read",
 				"Write",
 				"Edit",
 				"Glob",
 				"Grep",
-				"Bash(ls:*)",
-				"Bash(pwd)",
+				"Bash",
+				"Agent",
+				"WebFetch",
+				"WebSearch",
+				"AskUserQuestion",
 				"mcp__custom-workflow__*",
 			]);
 		} finally {
@@ -779,9 +851,9 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			const mcpServers = (options as any).mcpServers;
 			if (mcpServers) {
 				assert.ok(mcpServers["gsd-workflow"], "if present, must be gsd-workflow");
-				assert.deepEqual((options as any).disallowedTools, ["AskUserQuestion"]);
+				assert.deepEqual((options as any).disallowedTools, []);
 			} else {
-				assert.deepEqual((options as any).disallowedTools, ["AskUserQuestion"]);
+				assert.deepEqual((options as any).disallowedTools, []);
 			}
 			rmSync(emptyDir, { recursive: true, force: true });
 		} finally {
@@ -828,7 +900,7 @@ describe("stream-adapter — session persistence (#2859)", () => {
 			assert.equal(srv.env.GSD_CLI_PATH, "/tmp/gsd");
 			assert.equal(srv.env.GSD_PERSIST_WRITE_GATE_STATE, "1");
 			assert.equal(srv.env.GSD_WORKFLOW_PROJECT_ROOT, resolvedRepoDir);
-			assert.deepEqual(options.disallowedTools, ["AskUserQuestion"]);
+			assert.deepEqual(options.disallowedTools, []);
 		} finally {
 			process.chdir(originalCwd);
 			rmSync(repoDir, { recursive: true, force: true });
@@ -1216,11 +1288,15 @@ describe("stream-adapter — permission mode (F10)", () => {
 		}
 	}
 
-	test("buildSdkOptions defaults to bypassPermissions for backwards compatibility", () => {
+	test("buildSdkOptions defaults to bypassPermissions (globally unblocks all tools)", () => {
 		clearWorkflowMcpEnv();
 		const opts = buildSdkOptions("claude-sonnet-4-6", "test");
 		assert.equal(opts.permissionMode, "bypassPermissions");
-		assert.equal(opts.allowDangerouslySkipPermissions, true);
+		assert.equal(
+			opts.allowDangerouslySkipPermissions,
+			true,
+			"allowDangerouslySkipPermissions must be true when permissionMode is bypassPermissions",
+		);
 	});
 
 	test("buildSdkOptions respects explicit acceptEdits override", () => {
@@ -1232,6 +1308,11 @@ describe("stream-adapter — permission mode (F10)", () => {
 			false,
 			"allowDangerouslySkipPermissions must be false for non-bypass modes",
 		);
+	});
+
+	test("resolveClaudePermissionMode defaults to bypassPermissions when no env var is set (globally unblocks all tools)", async () => {
+		const mode = await resolveClaudePermissionMode({});
+		assert.equal(mode, "bypassPermissions");
 	});
 
 	test("resolveClaudePermissionMode honours the GSD_CLAUDE_CODE_PERMISSION_MODE env override", async () => {
@@ -1248,6 +1329,27 @@ describe("stream-adapter — permission mode (F10)", () => {
 			mode === "bypassPermissions" || mode === "acceptEdits",
 			`expected bypass or acceptEdits, got ${mode}`,
 		);
+	});
+
+	test("resolveClaudePermissionMode flips to bypassPermissions when GSD_HEADLESS=1 (#4657)", async () => {
+		const originalWarn = console.warn;
+		console.warn = () => {};
+		try {
+			const env = { GSD_HEADLESS: "1" } as NodeJS.ProcessEnv;
+			const mode = await resolveClaudePermissionMode(env);
+			assert.equal(mode, "bypassPermissions");
+		} finally {
+			console.warn = originalWarn;
+		}
+	});
+
+	test("resolveClaudePermissionMode: explicit override wins over GSD_HEADLESS=1", async () => {
+		const env = {
+			GSD_HEADLESS: "1",
+			GSD_CLAUDE_CODE_PERMISSION_MODE: "acceptEdits",
+		} as NodeJS.ProcessEnv;
+		const mode = await resolveClaudePermissionMode(env);
+		assert.equal(mode, "acceptEdits");
 	});
 });
 

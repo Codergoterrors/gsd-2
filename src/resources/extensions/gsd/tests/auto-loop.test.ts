@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { extractSourceRegion } from "./test-helpers.ts";
 import {
   resolveAgentEnd,
   resolveAgentEndCancelled,
@@ -10,6 +11,7 @@ import {
   autoLoop,
   detectStuck,
   _resetPendingResolve,
+  _hasPendingResolveForTest,
   _setActiveSession,
   isSessionSwitchInFlight,
   type UnitResult,
@@ -35,12 +37,15 @@ function makeMockSession(opts?: {
   newSessionDelayMs?: number;
   onNewSessionStart?: (session: any) => void;
   onNewSessionSettle?: (session: any) => void;
+  /** Called after the delay with the aborted state of any passed abortSignal.
+   *  Used to verify that runUnit passes an aborted signal on late resolution (#3731). */
+  onSignalCheck?: (aborted: boolean) => void;
 }) {
   const session = {
     active: true,
     verbose: false,
     cmdCtx: {
-      newSession: () => {
+      newSession: (options?: { abortSignal?: AbortSignal }) => {
         opts?.onNewSessionStart?.(session);
         if (opts?.newSessionThrows) {
           return Promise.reject(new Error(opts.newSessionThrows));
@@ -50,11 +55,17 @@ function makeMockSession(opts?: {
         if (delay > 0) {
           return new Promise<{ cancelled: boolean }>((res) =>
             setTimeout(() => {
+              // Simulate AgentSession.newSession() checking abortSignal after
+              // its internal async work (abort()) completes — this is where the
+              // real code captures process.cwd() and rebuilds the tool runtime.
+              // If the signal is aborted, the real code discards the session.
+              opts?.onSignalCheck?.(options?.abortSignal?.aborted ?? false);
               opts?.onNewSessionSettle?.(session);
               res(result);
             }, delay),
           );
         }
+        opts?.onSignalCheck?.(options?.abortSignal?.aborted ?? false);
         opts?.onNewSessionSettle?.(session);
         return Promise.resolve(result);
       },
@@ -349,6 +360,182 @@ test("runUnit cancels before dispatch when model restore fails after newSession"
   ]);
 });
 
+test("runUnit cancels before dispatch when provider is not request-ready (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => false,
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.match(
+    result.errorContext?.message ?? "",
+    /Provider anthropic is not request-ready/,
+  );
+  assert.equal(pi.calls.length, 0, "sendMessage must not be called when provider is not ready");
+  assert.equal(_hasPendingResolveForTest(), false, "provider cancellation must clear the pending resolver");
+});
+
+test("runUnit cancels before dispatch using currentUnitModel provider when set (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  // ctx.model uses "openai" which IS ready — if the code ignores currentUnitModel
+  // and falls back to ctx.model.provider, the unit would NOT be cancelled. The
+  // test therefore differentiates: only a bug (wrong provider lookup) would pass.
+  ctx.model = { provider: "openai", id: "gpt-4o" };
+  // modelRegistry says anthropic is not ready but openai is
+  ctx.modelRegistry = {
+    isProviderRequestReady: (provider: string) => provider === "openai",
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+  // currentUnitModel overrides the provider used in the readiness check
+  s.currentUnitModel = { provider: "anthropic", id: "claude-opus-4-6" };
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.match(
+    result.errorContext?.message ?? "",
+    /Provider anthropic is not request-ready/,
+  );
+  assert.equal(pi.calls.length, 0, "sendMessage must not be called — anthropic (currentUnitModel) is not ready");
+});
+
+test("runUnit does not cancel before dispatch when provider is request-ready (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => true,
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  await new Promise((r) => setTimeout(r, 10));
+  resolveAgentEnd(makeEvent());
+
+  const result = await resultPromise;
+  assert.equal(result.status, "completed");
+  assert.equal(pi.calls.length, 1, "sendMessage must be called when provider is ready");
+});
+
+test("runUnit proceeds when modelRegistry is absent (no readiness check available) (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  // No modelRegistry on ctx — pre-check should be skipped
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  await new Promise((r) => setTimeout(r, 10));
+  resolveAgentEnd(makeEvent());
+
+  const result = await resultPromise;
+  assert.equal(result.status, "completed");
+  assert.equal(pi.calls.length, 1);
+});
+
+test("runUnit proceeds when isProviderRequestReady throws (defensive) (#4555)", async () => {
+  _resetPendingResolve();
+
+  const ctx = makeMockCtx();
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    isProviderRequestReady: (_provider: string) => {
+      throw new Error("registry error");
+    },
+  };
+
+  const pi = makeMockPi();
+  const s = makeMockSession();
+
+  const result = await runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+  // When the readyCheck throws, ready=false → unit cancelled
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.errorContext?.category, "provider");
+  assert.equal(pi.calls.length, 0);
+});
+
+test("late-resolving newSession() after timeout receives aborted signal so tool runtime is not configured with root cwd (#3731)", async () => {
+  // When newSession() times out in runUnit(), auto-mode restores cwd to project
+  // root. If newSession() later resolves, it must NOT use process.cwd() to
+  // configure the tool runtime (which would give it root cwd, not worktree cwd).
+  //
+  // The fix: runUnit creates an AbortController, aborts it on timeout, and passes
+  // the signal to newSession(). AgentSession.newSession() checks the signal after
+  // its internal await this.abort() completes and returns early (discards) if aborted.
+  //
+  // This test uses mock.timers to control timing precisely.
+  _resetPendingResolve();
+  mock.timers.enable();
+
+  try {
+    let abortedWhenLateSessionSettled: boolean | null = null;
+
+    // newSession mock simulates AgentSession.newSession() behavior:
+    // after an internal delay (representing await this.abort()), it checks the
+    // abortSignal — that's where the real code would capture process.cwd() and
+    // call _buildRuntime. If aborted, the real code must discard the session.
+    const s = makeMockSession({
+      newSessionDelayMs: 200_000, // longer than NEW_SESSION_TIMEOUT_MS (120s)
+      onSignalCheck: (aborted) => {
+        abortedWhenLateSessionSettled = aborted;
+      },
+    });
+
+    const ctx = makeMockCtx();
+    const pi = makeMockPi();
+
+    const resultPromise = runUnit(ctx, pi, s, "task", "T01", "prompt");
+
+    // Tick past the 120s NEW_SESSION_TIMEOUT_MS — runUnit returns cancelled
+    mock.timers.tick(121_000);
+    await Promise.resolve();
+
+    const result = await resultPromise;
+    assert.equal(result.status, "cancelled", "runUnit must return cancelled on session timeout");
+
+    // Tick past the delayed newSession (200s total) — the late newSession resolves
+    mock.timers.tick(80_000);
+    // Drain microtask queue so the .finally() and setTimeout callbacks run
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The key assertion: when the late newSession() resolves, runUnit must have
+    // passed an aborted AbortSignal. Without the fix, no signal is passed and
+    // abortedWhenLateSessionSettled would be false (or null, if signal not passed at all).
+    assert.equal(
+      abortedWhenLateSessionSettled,
+      true,
+      "runUnit must pass an aborted AbortSignal to newSession() when it resolves after the session-creation timeout (#3731). " +
+      "Without this, AgentSession.newSession() captures root process.cwd() and rebuilds the tool runtime with wrong cwd.",
+    );
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 // ─── Structural assertions ───────────────────────────────────────────────────
 
 test("auto-loop.ts exports autoLoop, runUnit, resolveAgentEnd", async () => {
@@ -409,7 +596,7 @@ test("auto/phases.ts: selectAndApplyModel called exactly once and before updateP
   // Extract the runUnitPhase function body
   const fnStart = src.indexOf("export async function runUnitPhase");
   assert.ok(fnStart > 0, "runUnitPhase should exist in phases.ts");
-  const fnBody = src.slice(fnStart, fnStart + 12000);
+  const fnBody = extractSourceRegion(src, "export async function runUnitPhase");
 
   // selectAndApplyModel must appear exactly once
   const allOccurrences = [...fnBody.matchAll(/selectAndApplyModel\(/g)];
@@ -497,6 +684,8 @@ function makeMockDeps(
     autoWorktreeBranch: () => "auto/M001",
     resolveMilestoneFile: () => null,
     reconcileMergeState: () => "clean",
+    preflightCleanRoot: () => ({ stashPushed: false, summary: "" }),
+    postflightPopStash: () => {},
     getLedger: () => null,
     getProjectTotals: () => ({ cost: 0 }),
     formatCost: (c: number) => `$${c.toFixed(2)}`,
@@ -660,6 +849,45 @@ test("autoLoop exits on terminal complete state", async (t) => {
   assert.ok(
     !deps.callLog.includes("resolveDispatch"),
     "should not dispatch when complete",
+  );
+});
+
+test("autoLoop pauses when provider readiness cancels before dispatch", async () => {
+  _resetPendingResolve();
+
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const ctx = makeMockCtx();
+  ctx.ui.setStatus = () => {};
+  ctx.ui.notify = (message: string, level?: string) => {
+    notifications.push({ message, level });
+  };
+  ctx.model = { provider: "anthropic", id: "claude-opus-4-6" };
+  ctx.modelRegistry = {
+    getProviderAuthMode: () => "api-key",
+    isProviderRequestReady: () => false,
+  };
+
+  const pi = makeMockPi();
+  const s = makeLoopSession();
+  const deps = makeMockDeps({
+    selectAndApplyModel: async () => ({
+      routing: null,
+      appliedModel: { provider: "anthropic", id: "claude-opus-4-6" },
+    }),
+  });
+
+  await autoLoop(ctx, pi, s, deps);
+
+  assert.equal(pi.calls.length, 0, "provider readiness cancellation must not dispatch a message");
+  assert.ok(deps.callLog.includes("pauseAuto"), "provider readiness cancellation should pause auto-mode");
+  assert.ok(!deps.callLog.includes("stopAuto"), "provider readiness cancellation should not hard-stop auto-mode");
+  assert.ok(
+    !deps.callLog.includes("postUnitPreVerification"),
+    "post-unit verification must not run after pre-dispatch provider cancellation",
+  );
+  assert.ok(
+    notifications.some(n => /Provider anthropic is not request-ready/.test(n.message)),
+    "provider pause should notify with the readiness failure",
   );
 });
 
@@ -1311,9 +1539,7 @@ test("auto.ts startAuto dispatches through the UOK kernel wrapper with explicit 
   // Find the startAuto function body
   const fnIdx = src.indexOf("export async function startAuto");
   assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
-  const fnEnd = src.indexOf("\n// ─── ", fnIdx + 100);
-  const fnBlock =
-    fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 5000);
+  const fnBlock = extractSourceRegion(src, "export async function startAuto", "\n// ─── ");
   assert.ok(
     fnBlock.includes("runAutoLoopWithUok("),
     "startAuto must dispatch through runAutoLoopWithUok()",
@@ -1335,9 +1561,7 @@ test("startAuto calls selfHealRuntimeRecords before autoLoop (#1727)", { skip: "
   );
   const fnIdx = src.indexOf("export async function startAuto");
   assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
-  const fnEnd = src.indexOf("\n// ─── ", fnIdx + 100);
-  const fnBlock =
-    fnEnd > -1 ? src.slice(fnIdx, fnEnd) : src.slice(fnIdx, fnIdx + 5000);
+  const fnBlock = extractSourceRegion(src, "export async function startAuto", "\n// ─── ");
 
   // Both autoLoop call sites must be preceded by selfHealRuntimeRecords
   const healIdx = fnBlock.indexOf("selfHealRuntimeRecords");
@@ -1362,7 +1586,7 @@ test("startAuto guards against concurrent invocation (#2923)", () => {
   const fnIdx = src.indexOf("export async function startAuto");
   assert.ok(fnIdx > -1, "startAuto must exist in auto.ts");
   // The guard must appear before any other logic in the function body
-  const fnBody = src.slice(fnIdx, fnIdx + 500);
+  const fnBody = extractSourceRegion(src, "export async function startAuto");
   const activeGuard = fnBody.indexOf("if (s.active)");
   assert.ok(activeGuard > -1, "startAuto must check s.active to prevent concurrent auto-loops");
   const returnIdx = fnBody.indexOf("return;", activeGuard);
@@ -1423,9 +1647,16 @@ test("auto-timeout-recovery.ts calls resolveAgentEnd instead of dispatchNextUnit
     !src.includes("await dispatchNextUnit"),
     "auto-timeout-recovery.ts must not call dispatchNextUnit",
   );
+  // After PR #4716, advance branches go through bumpAndResolveSynthetic()
+  // (which bumps the turn epoch and calls resolveAgentEnd atomically).
+  // Either direct resolveAgentEnd() or the helper satisfies the invariant:
+  // the loop must be re-iterated on timeout recovery.
+  const reIteratesLoop =
+    src.includes("resolveAgentEnd(") ||
+    src.includes("bumpAndResolveSynthetic(");
   assert.ok(
-    src.includes("resolveAgentEnd("),
-    "auto-timeout-recovery.ts must call resolveAgentEnd to re-iterate the loop on timeout recovery",
+    reIteratesLoop,
+    "auto-timeout-recovery.ts must call resolveAgentEnd (directly or via bumpAndResolveSynthetic) to re-iterate the loop on timeout recovery",
   );
 });
 

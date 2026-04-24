@@ -13,10 +13,11 @@ import { appendEvent } from "./workflow-events.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { clearParseCache } from "./files.js";
 import { parseRoadmap as parseLegacyRoadmap, parsePlan as parseLegacyPlan } from "./parsers-legacy.js";
-import { isDbAvailable, getTask, getSlice, getSliceTasks, getPendingGates, updateTaskStatus, updateSliceStatus } from "./gsd-db.js";
+import { isDbAvailable, getTask, getSlice, getSliceTasks, getPendingGates, updateTaskStatus, updateSliceStatus, insertSlice, getMilestone } from "./gsd-db.js";
 import { isValidationTerminal } from "./state.js";
 import { getErrorMessage } from "./error-utils.js";
 import { logWarning, logError } from "./workflow-logger.js";
+import { isClosedStatus } from "./status-guards.js";
 import {
   nativeConflictFiles,
   nativeCommit,
@@ -50,9 +51,14 @@ import {
   resolveExpectedArtifactPath,
   diagnoseExpectedArtifact,
 } from "./auto-artifact-paths.js";
+import { classifyMilestoneSummaryContent } from "./milestone-summary-classifier.js";
 
 // Re-export so existing consumers of auto-recovery.ts keep working.
 export { resolveExpectedArtifactPath, diagnoseExpectedArtifact };
+export {
+  classifyMilestoneSummaryContent,
+  type MilestoneSummaryOutcome,
+} from "./milestone-summary-classifier.js";
 
 // ─── Artifact Resolution & Verification ───────────────────────────────────────
 
@@ -268,11 +274,26 @@ export function verifyExpectedArtifact(
   // RESEARCH file. Without this, resolveExpectedArtifactPath returns null and
   // the retry/escalation machinery silently re-dispatches forever.
   //
+  // #4068: Also treat a PARALLEL-BLOCKER placeholder as a terminal completion
+  // so that timeout-recovery can write the blocker, have verifyExpectedArtifact
+  // return true, and let the dispatch loop advance past this unit.  Without
+  // this, the blocker is written but verification still returns false, the unit
+  // is never cleared from unitDispatchCount, and on the next iteration the
+  // dispatch rule (which correctly skips parallel-research when PARALLEL-BLOCKER
+  // exists) returns null — leaving the loop stuck re-deriving indefinitely.
+  //
   // NOTE: this predicate mirrors the dispatch rule at
   // auto-dispatch.ts parallel-research-slices — keep the two in sync.
   if (unitType === "research-slice" && unitId.endsWith("/parallel-research")) {
     const { milestone: mid } = parseUnitId(unitId);
     if (!mid) return false;
+
+    // #4068: PARALLEL-BLOCKER written by timeout-recovery is a terminal state.
+    const blockerPath = resolveExpectedArtifactPath(unitType, unitId, base);
+    if (blockerPath && existsSync(blockerPath)) {
+      return true;
+    }
+
     const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
     if (!roadmapFile || !existsSync(roadmapFile)) {
       logWarning("recovery", `verify-fail ${unitType} ${unitId}: roadmap missing`);
@@ -462,6 +483,14 @@ export function verifyExpectedArtifact(
   // A milestone with only .gsd/ plan files and zero implementation code is
   // not genuinely complete — the LLM wrote plan files but skipped actual work.
   if (unitType === "complete-milestone") {
+    const summaryOutcome = classifyMilestoneSummaryContent(readFileSync(absPath, "utf-8"));
+    if (summaryOutcome === "failure") return false;
+    const { milestone: mid } = parseUnitId(unitId);
+    if (mid && isDbAvailable()) {
+      const dbMilestone = getMilestone(mid);
+      if (!dbMilestone) return false;
+      if (!isClosedStatus(dbMilestone.status) && summaryOutcome !== "success") return false;
+    }
     if (hasImplementationArtifacts(base) === "absent") return false;
   }
 
@@ -531,6 +560,16 @@ export function writeBlockerPlaceholder(
     if (unitType === "complete-slice" && mid && sid) {
       try { updateSliceStatus(mid, sid, "complete", ts); } catch (e) { logWarning("recovery", `updateSliceStatus failed during context exhaustion: ${e instanceof Error ? e.message : String(e)}`); }
       try { appendEvent(base, { cmd: "complete-slice", params: { milestoneId: mid, sliceId: sid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for slice recovery: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+    // Insert a placeholder complete slice so deriveState sees activeMilestoneSlices.length > 0
+    // and exits the pre-planning phase. Without this, activeMilestoneSlices stays empty
+    // after the blocker ROADMAP.md is written, causing deriveState to return phase:'pre-planning'
+    // indefinitely and re-dispatching plan-milestone in an infinite loop (#4378).
+    if (unitType === "plan-milestone" && mid) {
+      try {
+        insertSlice({ id: "S00-blocker", milestoneId: mid, title: "Blocker placeholder — planning failed", status: "complete", sequence: 0 });
+      } catch (e) { logWarning("recovery", `insertSlice placeholder failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
+      try { appendEvent(base, { cmd: "plan-milestone", params: { milestoneId: mid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
     }
   }
 
